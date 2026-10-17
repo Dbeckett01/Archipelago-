@@ -778,22 +778,25 @@ var AR = {};
     YEAR: 240,               // ticks per year (seasons)
     baseCost: 0.0105,        // energy per tick for mass 1 at rest
     costSpeed: 1.0, costSense: 0.2, costArmor: 0.6, costPoison: 0.3, costResist: 0.22, costFur: 0.14, costCrest: 0.10,
-    costSwim: 0.1, costXeric: 0.2, costOmni: 0.2,
-    plantA: 0.25, plantB: 0.85, meatExp: 0.6, bugQ: 1.15, huntMin: 0.35,
+    costSwim: 0.2, costXeric: 0.2, costOmni: 0.2,
+    plantA: 0.25, plantB: 0.85, meatExp: 0.6, bugQ: 1.15, fishQ: 2.2, fishImm: 0.02, fishGrow: 0.003, huntMin: 0.35,
     moveCost: 0.010,         // * mass * (v/0.3)^2
     emaxPerMass: 10,
     biteP: 0.13, biteM: 0.5,
     thermalK: 0.075,
     aridK: 2.1,              // water stress in deserts (multiples of resting cost)
-    meatPerMass: 7.0,
+    meatPerMass: 2.0,        // energy in a body's flesh per unit of mass: a little less than it cost to grow (growthCost * 0.75)
+    fatK: 0.6,               // share of a body's stored energy that an eater gets back
     toxinPerMass: 7.0,
     reach: 0.65,
-    plantMax: 3.4, kelpMax: 1.4, fishMax: 1.4, bugMax: 0.7,
+    plantMax: 3.4, kelpMax: 1.4, fishMax: 2.0, bugMax: 0.7,
     growthCost: 2.5,
     breedAt: 0.5,
     weakPrey: 0,
     assort: 1,
-    patchMem: 1, momDef: 1, imgBase: 0.4,
+    patchMem: 1, momDef: 0.85, imgBase: 0.6,
+    bugEat: 5,               // plant litter used per unit of insect growth: each step up the food chain loses most of the energy
+    litter: 0.006,           // litter shed each tick, as a share of the standing plants
     costMul: 1, lifeMul: 1, breedMul: 1, huntMul: 1
   };
 
@@ -874,7 +877,7 @@ var AR = {};
     ph[po + Pk.EMAX] = CFG.emaxPerMass * mass * (1 + 0.5 * M.smooth(0.4, 0.9, diet));
     ph[po + Pk.COST] = CFG.baseCost * CFG.costMul * m34 * (1 + CFG.costSpeed * speed * speed + CFG.costSense * sense * sense +
       CFG.costArmor * armor * Math.sqrt(armor) + CFG.costPoison * poison + CFG.costResist * resist + CFG.costFur * fur * fur +
-      CFG.costCrest * crest * crest + CFG.costSwim * swim + CFG.costXeric * xeric + CFG.costOmni * G.omniCost(diet));
+      CFG.costCrest * crest * crest + CFG.costSwim * swim * swim + CFG.costXeric * xeric + CFG.costOmni * G.omniCost(diet));
     // comfortable temperatures: fur (or blubber) and bulk protect against cold but overheat in the heat;
     // desert adaptations (big ears, pale coat, thrifty kidneys) push the upper limit up
     ph[po + Pk.TLO] = 12 - 32 * fur * (0.55 + 0.45 * Math.min(1.8, Math.cbrt(mass))) - 3 * size;
@@ -893,9 +896,11 @@ var AR = {};
     ph[po + Pk.EKELP] = ep * 0.95 * (0.35 + 0.65 * Math.pow(M.smooth(0, 0.45, swim), 0.7));
     // hidden food (fish, grubs) is found by keen senses
     var nose = Math.min(1.15, 0.55 + 0.9 * sense);
-    ph[po + Pk.EFISH] = em * M.smooth(0.3, 0.75, swim) * (0.7 + 0.3 * speed) * nose;
+    // crabs, shellfish and small fish can be caught in the shallows by any meat-eater; open-water fish need swimmers
+    // (a rich meal: bigger animals take bigger prey, so fishing suits a larger meat-eater than insects do)
+    ph[po + Pk.EFISH] = em * CFG.fishQ * (0.85 + 0.15 * M.smooth(0.15, 0.7, swim)) * (0.75 + 0.25 * speed) * nose * M.clamp(1 + 0.25 * size, 0.8, 1.35);
     // insects and grubs: food for anyone with a meat-eater's jaws and gut, easiest for small, nimble animals
-    ph[po + Pk.EBUGS] = em * M.clamp(CFG.bugQ - 0.3 * size, 0.15, 1.4) * landK * nose;
+    ph[po + Pk.EBUGS] = em * M.clamp(CFG.bugQ - 0.25 * size, 0.15, 1.3) * landK * nose / 1.15;
     ph[po + Pk.LIFE] = CFG.T * 12 * Math.pow(mass, 0.2) * CFG.lifeMul;
     ph[po + Pk.MATURE] = CFG.T * 2.0 * Math.pow(mass, 0.25) * (1 + 0.35 * armor) * CFG.breedMul;
     ph[po + Pk.NBROOD] = 1 + Math.floor(brood * 4.999);
@@ -1159,6 +1164,8 @@ var AR = {};
     this.islandOf = new Int16Array(N).fill(-1);
     this.biome = new Uint8Array(N);
     this.active = new Int32Array(N); this.nActive = 0;
+    this.shoreN = new Int32Array(N).fill(-1);   // nearest shallow water (for land cells near the coast)
+    this.shoreD = new Uint8Array(N); this.shoreQ = new Int32Array(N);
     this.rowT = new Float32Array(this.H); this.rowAmp = new Float32Array(this.H); this.rowBelt = new Float32Array(this.H);
     this.sc = -1;                         // seasonal coefficient: -1 midwinter .. +1 midsummer
   };
@@ -1526,7 +1533,34 @@ var AR = {};
       }
     }
     this.nActive = na;
+    this.findShore();
     this.climT = t;
+  };
+
+  // the water's edge: every land cell within a few steps of the sea knows where the nearest shallows are,
+  // so animals living near the coast can go down to the shore to feed
+  var SHORE_R = 9;
+  World.prototype.findShore = function () {
+    var W = this.W, H = this.H, N = W * H, land = this.land, e = this.elev, sea = this.clim.sea;
+    var sh = this.shoreN, sd = this.shoreD, q = this.shoreQ, qt = 0;
+    sh.fill(-1);
+    for (var c = 0; c < N; c++) {
+      if (land[c] || sea - e[c] > 0.03) continue;
+      var x = c % W, y = (c / W) | 0;
+      if ((x > 0 && land[c - 1]) || (x < W - 1 && land[c + 1]) || (y > 0 && land[c - W]) || (y < H - 1 && land[c + W])) { sh[c] = c; sd[c] = 0; q[qt++] = c; }
+    }
+    for (var qh = 0; qh < qt; qh++) {
+      var a = q[qh], d = sd[a] + 1;
+      if (d > SHORE_R) continue;
+      var ax = a % W, ay = (a / W) | 0, src = sh[a];
+      for (var k = 0; k < 4; k++) {
+        var nx = ax + (k === 0 ? 1 : k === 1 ? -1 : 0), ny = ay + (k === 2 ? 1 : k === 3 ? -1 : 0);
+        if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+        var n = ny * W + nx;
+        if (!land[n] || sh[n] >= 0) continue;
+        sh[n] = src; sd[n] = d; q[qt++] = n;
+      }
+    }
   };
 
   // plants, kelp and fish regrow logistically. Each tick one eighth of the living cells is updated (dt = 8).
@@ -1535,7 +1569,7 @@ var AR = {};
     var act = this.active, n = this.nActive, dt = GSTEP, sc = this.sc, land = this.land;
     var TM = this.tmean, TA = this.tamp;
     var G = this.grass, GM = this.gmax, GG = this.ggrow, B = this.browse, BM = this.bmax, BG = this.bgrow;
-    var K = this.kelp, KM = this.kmax, F = this.fish, FM = this.fmax, I = this.bugs, IM = this.imax, IG = this.igrow;
+    var K = this.kelp, KM = this.kmax, F = this.fish, FM = this.fmax, I = this.bugs, IM = this.imax, IG = this.igrow, BE = AR.CFG.bugEat, LT = AR.CFG.litter, FI = AR.CFG.fishImm, FR = AR.CFG.fishGrow;
     for (var j = t % GSTEP; j < n; j += GSTEP) {
       var i = act[j];
       var T = TM[i] + TA[i] * sc;
@@ -1555,11 +1589,20 @@ var AR = {};
           var rb = BG[i] * sm(-2, 10, T);
           if (rb > 0) B[i] = bw + dt * rb * (bw + 0.18 * bm) * (1 - bw / bm);
         }
-        var im = IM[i], iv = I[i];
-        if (im <= 0) { if (iv > 0) I[i] = iv * 0.9; }
+        // plants make more than the grazers eat and shed the rest as fallen leaves and stems. Insects and grubs
+        // live on this litter (what they leave rots), so they thrive only where vegetation is thick, and every
+        // unit of insect costs several units of plant
+        var veg = G[i] + B[i], lit = LT * dt * veg;
+        var im = IM[i], iv = I[i], vcap = 0.6 * (gm + bm);
+        if (im > 0 && veg < vcap) im *= veg / vcap;
+        if (im <= 0.005) { if (iv > 0) I[i] = iv * 0.9; }
         else if (iv > im) I[i] = iv - (iv - im) * 0.02 * dt;
         else if (T < 0) { if (iv > 0.25 * im) I[i] = iv - iv * 0.003 * dt; }   // insects lie dormant in winter (grubs stay in the ground)
-        else I[i] = iv + dt * IG[i] * sm(0, 14, T) * (iv + 0.1 * im) * (1 - iv / im);
+        else {
+          var di = dt * IG[i] * sm(0, 14, T) * (iv + 0.1 * im) * (1 - iv / im);
+          if (di * BE > lit) di = lit / BE;
+          I[i] = iv + di;
+        }
       } else {
         var km = KM[i], kv = K[i];
         if (km <= 0) { if (kv > 0) K[i] = kv * 0.9; }
@@ -1569,7 +1612,7 @@ var AR = {};
         var fm = FM[i], fv = F[i];
         if (fm <= 0) { if (fv > 0) F[i] = fv * 0.9; }
         else if (fv > fm) F[i] = fv - (fv - fm) * 0.02 * dt;
-        else F[i] = fv + dt * 0.011 * (fv + 0.15 * fm) * (1 - fv / fm);
+        else F[i] = fv + dt * FR * (fv + FI * fm) * (1 - fv / fm);   // (a fished-out shore restocks slowly)
       }
     }
   };
@@ -1734,7 +1777,7 @@ var AR = {};
     // carcasses
     this.cAlive = new Uint8Array(CCAP);
     this.cx = f32(CCAP); this.cy = f32(CCAP);
-    this.cMeat = f32(CCAP); this.cTox = f32(CCAP);
+    this.cMeat = f32(CCAP); this.cTox = f32(CCAP); this.cMax = f32(CCAP);
     this.cMass = f32(CCAP);
     this.cLab = f32(CCAP * 3);
     this.cSp = new Int32Array(CCAP);
@@ -1844,7 +1887,7 @@ var AR = {};
   // food value of an animal's body: size, condition (fat) and armour (inedible plates)
   Sim.prototype.nutrition = function (i) {
     var o = i * NP;
-    return CFG.meatPerMass * this.cm[i] * (1 - 0.35 * this.ph[o + pARMOR]) * (1 - 0.1 * this.ph[o + pDIET]) + 0.4 * Math.max(0, this.E[i]);
+    return CFG.meatPerMass * this.cm[i] * (1 - 0.35 * this.ph[o + pARMOR]) * (1 - 0.1 * this.ph[o + pDIET]) + CFG.fatK * Math.max(0, this.E[i]);
   };
   Sim.prototype.toxin = function (i) {
     var p = this.peff(i) - 0.05;   // trace amounts are harmless
@@ -1860,7 +1903,7 @@ var AR = {};
     this.cx[c] = this.x[i]; this.cy[c] = this.y[i];
     // animals that die of old age, hunger or exposure are thin, and lie a while before anyone finds them
     var meat = this.nutrition(i) * (killerUid ? 1 : 0.45);
-    this.cMeat[c] = meat;
+    this.cMeat[c] = meat; this.cMax[c] = meat;
     this.cTox[c] = this.toxin(i) / Math.max(0.01, meat);   // toxin per unit of meat
     this.cMass[c] = this.cm[i];
     this.cLab[c * 3] = this.ph[o + pCL]; this.cLab[c * 3 + 1] = this.ph[o + pCA]; this.cLab[c * 3 + 2] = this.ph[o + pCB];
@@ -2177,7 +2220,8 @@ var AR = {};
         if (d2 > r2) continue;
         if (++checks > cap) break;   // enough company considered (nearest buckets come first)
         // interference: close neighbours compete for the same patch; size decides who eats
-        if (d2 < 1.44) { var ddt = this.diet[j] - dietI; if (ddt < 0.3 && ddt > -0.3) { var rm = this.cm[j] / cmI; press += rm * rm; } }
+        // (a mother does not push her own young off their food)
+        if (d2 < 1.44) { var ddt = this.diet[j] - dietI; if (ddt < 0.3 && ddt > -0.3 && this.mom[i] !== this.uid[j]) { var rm = this.cm[j] / cmI; press += rm * rm; } }
         var d = Math.sqrt(d2) + 1e-4;
         var same = sp[j] === mySp;
         if (same) {
@@ -2203,7 +2247,7 @@ var AR = {};
                 var p = Sim.odds(myAtk, Dj);
                 var vr = jWet ? this.vW[j] / (vWi > 0.01 ? vWi : 0.01) : this.vL[j] / vLi;
                 var chase = vr < 0.85 ? 1 : (vr < 1.25 ? 1.6 - 0.7 * vr : 0.1);
-                var nut = CFG.meatPerMass * this.cm[j];
+                var nut = this.nutrition(j);
                 // expected energy per tick over the whole hunt: chase + meal
                 var meal = Math.min(nut, (emax - this.E[i]) / Math.max(0.05, eMeat) + biteM);
                 var tEat = meal / biteM, tGo = d / ((jWet ? vWi : vLi) * 0.9 + 0.01) + 1.5;
@@ -2306,6 +2350,22 @@ var AR = {};
         if (orr > 1 && orr < pr * 1.5 && ox >= 0 && oy >= 0 && ox < W && oy < H) {
           var opv = this.foodVal(i, (oy | 0) * W + (ox | 0));
           if (opv > 0) { opv /= (1 + orr * 0.1); if (opv > plantV * 1.3) { plantV = opv; ptx = ox; pty = oy; plantHere = false; } }
+        }
+      }
+      // fishers and swimmers know where the water's edge is, and try a stretch of it
+      if ((this.eF[i] > 0.1 || dmI > 0.02) && !inWater) {
+        var shc = w.shoreN[cell];
+        if (shc >= 0) {
+          var scx = shc % W + ((rng.next() * 7) | 0) - 3, scy = ((shc / W) | 0) + ((rng.next() * 7) | 0) - 3;
+          if (scx >= 0 && scy >= 0 && scx < W && scy < H) {
+            var sc2 = scy * W + scx;
+            if (land[sc2]) sc2 = shc;
+            var spx = sc2 % W + 0.5, spy = ((sc2 / W) | 0) + 0.5, sdx = spx - xi, sdy = spy - yi, srr = Math.sqrt(sdx * sdx + sdy * sdy);
+            if (srr < pr * 1.5) {
+              var spv = this.foodVal(i, sc2);
+              if (spv > 0) { spv /= (1 + srr * 0.1); if (spv > plantV * 1.3) { plantV = spv; ptx = spx; pty = spy; plantHere = false; } }
+            }
+          }
         }
       }
       for (var s = 0; s < nS; s++) {
@@ -3256,8 +3316,11 @@ var AR = {};
     var dX = tn.XERIC - to.XERIC;
     if (dX > 0.18) add(['deserti', 'arenarius', 'aridus'], 3 + dX * 7);
     var dBr = tn.BROWSE - to.BROWSE;
-    if (dBr > 0.2) add(['frondivorus', 'folivorus', 'arborum'], 2.5 + dBr * 6);
-    if (dBr < -0.2) add(['graminivorus', 'pascuus', 'pratorum'], 2.5 - dBr * 6);
+    // (grass or leaves only matters to a plant-eater)
+    if (dBr > 0.2 && tn.DIET < 0.45) add(['frondivorus', 'folivorus', 'arborum'], 2.5 + dBr * 6);
+    if (dBr < -0.2 && tn.DIET < 0.45) add(['graminivorus', 'pascuus', 'pratorum'], 2.5 - dBr * 6);
+    // a meat-eater that has changed what it lives on
+    if (tn.DIET >= 0.45 && to.DIET >= 0.45 && tn.fk[3] > 0.4 && to.fk[3] < 0.25) add(['piscivorus', 'piscator'], 6);
     if (tn.fk[2] > 0.4 && to.SWIM < 0.4) add(['algivorus', 'phycophagus'], 4);
     if (lm > 0.45) add(lm > 1.1 ? ['giganteus', 'titan'] : ['magnus', 'major'], 2.5 + lm * 2);
     if (lm < -0.45) add(lm < -1.1 ? ['pumilus', 'nanus'] : ['minor', 'parvus'], 2.5 - lm * 2);
@@ -3332,6 +3395,10 @@ var AR = {};
       if ((fs[6] || 0) > 0.45 && !n.bugs) {
         n.bugs = sim.t;
         Sp.note(sim, 'predator', nm + ' have become insect-eaters', S.cx, S.cy, S.id);
+      }
+      if (fs[3] > 0.2 && t.DIET >= 0.45 && t.SWIM < 0.3 && !n.shore && !n.fish) {
+        n.shore = sim.t;
+        Sp.note(sim, 'predator', nm + ' have started foraging along the shore, catching crabs and shellfish', S.cx, S.cy, S.id);
       }
       if (fs[3] > 0.4 && !n.fish) {
         n.fish = sim.t;
@@ -3433,7 +3500,8 @@ var AR = {};
       var c = w.cellAt(sim.x[r], sim.y[r]);
       var isl = w.islandOf[c];
       if (!w.land[c] || isl < 0 || (cnt[isl] || 0) < 25) continue;
-      var v = w.imax[c] * (1 - w.arid[c]) * (0.2 + M.smooth(2, 16, w.tmean[c]));   // warm, insect-rich places
+      var v = w.bugs[c] * (1 - w.arid[c]) * (0.2 + M.smooth(2, 16, w.tmean[c]));   // warm places swarming with insects
+      if (!(w.shoreN[c] >= 0 && w.shoreD[c] <= 4)) v *= 0.5;   // castaways wash up near a beach
       if (v > bv) { bv = v; best = r; }
     }
     if (best < 0) return;
@@ -3441,10 +3509,10 @@ var AR = {};
     var I = w.isles[isleId];
     var ov = sim.ov, S0 = sim.species[0];
     var t2 = {
-      SIZE: -0.4, SPEED: 0.32, SENSE: 0.5, FUR: AR.Sim.furFor(w.tmean[hc]), ARMOR: 0.04, DIET: 0.62, BROWSE: 0.5, SWIM: 0.06, XERIC: M.clamp(w.arid[hc] * 0.8, 0.08, 0.6),
+      SIZE: -0.4, SPEED: 0.32, SENSE: 0.6, FUR: AR.Sim.furFor(w.tmean[hc]), ARMOR: 0.04, DIET: 0.75, BROWSE: 0.5, SWIM: 0.06, XERIC: M.clamp(w.arid[hc] * 0.8, 0.08, 0.6),
       POISON: 0.0, RESIST: 0.06, COATL: 0.42, COATA: 0.05, COATB: 0.1, DISP: S0 && S0.sample ? M.wrap01(G.locusValue(S0.sample, 0, G.DISP) + 0.35 + rng.next() * 0.3) : rng.next(), CHOOSY: ov.choosy, CREST: 0.25, BROOD: 0.3,
       AGGR: 0.3, FEAR: 0.5, SOCIAL: 0.15, WARY: 0.3, MUT: ov.mut, pattern: 1,
-      sd: { DIET: 0.04, AGGR: 0.08, SIZE: 0.2, BROWSE: 0.08 }
+      sd: { DIET: 0.04, AGGR: 0.08, SIZE: 0.2, BROWSE: 0.08, SWIM: 0.07 }
     };
     t2.PREF = t2.DISP;
     var S = AR.Species.create(sim, -1, AR.Species.newGenus(sim), 'entomophagus');
@@ -3782,7 +3850,7 @@ var AR = {};
   var A_I32 = ['uid', 'sp', 'gen', 'mom', 'dad', 'dadSp', 'tgt', 'tgtU', 'kills', 'kids', 'momI'];
   var A_U8 = ['alive', 'sex', 'st', 'lastAte', 'fk', 'inW', 'nd'];
   var A_I16 = ['timer', 'cool', 'huntCool', 'cast'];
-  var C_ARR = ['cAlive', 'cx', 'cy', 'cMeat', 'cTox', 'cMass', 'cSp', 'cKill', 'cAge'];
+  var C_ARR = ['cAlive', 'cx', 'cy', 'cMeat', 'cTox', 'cMass', 'cSp', 'cKill', 'cAge', 'cMax'];
   var SIM_KEYS = ['t', 'nextId', 'species', 'notes', 'hist', 'flags', 'counters', 'colonised', 'bridgeLabel', 'bridgePend', '_genera', 'foundIsle', 'founderName', 'noteId', 'lowPop', 'bridgeOpen', 'ancestor', 'ancestor2'];
   var W_ARR = ['grass', 'browse', 'kelp', 'fish', 'bugs', 'soil', 'islandOf'];
 
@@ -3826,7 +3894,8 @@ var AR = {};
     for (i = 0; i < n; i++) if (sim.alive[i]) { sim.derive(i); sim.count++; }
     // carcasses
     var nc = o.cHi;
-    C_ARR.forEach(function (k) { sim[k].set(o.c[k]); });
+    C_ARR.forEach(function (k) { if (o.c[k]) sim[k].set(o.c[k]); });
+    if (!o.c.cMax) sim.cMax.set(o.c.cMeat);   // (saved by version 3)
     sim.cLab.set(o.c.cLab);
     sim.cHi = nc; sim.cCount = 0; sim.cNfree = 0;
     for (var c = AR.Sim.CCAP - 1; c >= 0; c--) { if (c < nc && sim.cAlive[c]) continue; sim.cFree[sim.cNfree++] = c; }
@@ -4134,6 +4203,7 @@ var AR = {};
   var RAMP_GRASS = [[52, 40, 28], [120, 96, 56], [170, 172, 70], [196, 214, 92]];
   var RAMP_LEAF = [[52, 40, 28], [96, 92, 50], [52, 132, 64], [30, 104, 58]];
   var RAMP_SEAF = [[16, 34, 58], [24, 86, 112], [48, 160, 170], [140, 232, 220]];
+  var RAMP_BUGS = [[44, 34, 30], [112, 76, 42], [196, 132, 48], [250, 206, 96]];
   var RAMP_TEMP = [[60, 70, 170], [90, 150, 220], [235, 240, 236], [246, 190, 90], [214, 70, 52]];
   var RAMP_RAIN = [[150, 96, 52], [214, 182, 110], [150, 196, 112], [64, 160, 150], [44, 92, 190]];
   var RAMP_FOOD = [[52, 40, 28], [140, 124, 60], [120, 168, 72], [44, 120, 64]];
@@ -4145,7 +4215,7 @@ var AR = {};
   }
   Terrain.ramp = ramp;
   Terrain.RAMP_TEMP = RAMP_TEMP; Terrain.RAMP_FOOD = RAMP_FOOD; Terrain.RAMP_RAIN = RAMP_RAIN; Terrain.RAMP_SEAF = RAMP_SEAF;
-  Terrain.RAMP_GRASS = RAMP_GRASS; Terrain.RAMP_LEAF = RAMP_LEAF;
+  Terrain.RAMP_GRASS = RAMP_GRASS; Terrain.RAMP_LEAF = RAMP_LEAF; Terrain.RAMP_BUGS = RAMP_BUGS;
   Terrain.tempRange = [-25, 40];
 
   Terrain.prototype.paintLens = function (lens, mode) {
@@ -4153,17 +4223,20 @@ var AR = {};
     this.lensOn = lens === 'food' || lens === 'climate';
     if (!this.lensOn) return;
     var C2 = AR.CFG, pm = C2.plantMax * 1.25, sf = C2.kelpMax + C2.fishMax, k = this.seasonal, sc = w.sc;
-    var tr = Terrain.tempRange, tspan = tr[1] - tr[0];
+    var tr = Terrain.tempRange, tspan = tr[1] - tr[0], bugsMode = mode === 'insects';
     for (var i = 0; i < N; i++) {
       var o = i * 4, c, a = 0;
       if (!w.land[i]) {
         if (lens === 'food' && w.kmax[i] + w.fmax[i] > 0.02) {
-          c = ramp(RAMP_SEAF, Math.pow((w.kelp[i] + w.fish[i]) / sf, 0.7)); a = 200;
+          c = ramp(RAMP_SEAF, Math.pow((bugsMode ? w.fish[i] / C2.fishMax : (w.kelp[i] + w.fish[i]) / sf), 0.7)); a = 200;
           D[o] = c[0]; D[o + 1] = c[1]; D[o + 2] = c[2]; D[o + 3] = a;
         } else D[o + 3] = 0;
         continue;
       }
-      if (lens === 'food') {
+      if (lens === 'food' && bugsMode) {
+        // insects and grubs: the food of small meat-eaters (they live on the plants)
+        c = ramp(RAMP_BUGS, Math.pow(w.bugs[i] / (C2.bugMax * 0.9), 0.7)); a = 220;
+      } else if (lens === 'food') {
         // land food: brightness from how much there is, green-blue for leaves, yellow-green for grass
         var g = w.grass[i], bw = w.browse[i], tot = g + bw;
         var lv = Math.pow(tot / pm, 0.7), share = tot > 0.01 ? bw / tot : 0.5;
@@ -4826,7 +4899,7 @@ var AR = {};
       if (!sim.cAlive[c]) continue;
       var x = sim.cx[c], y = sim.cy[c];
       if (x < x0 || x > x1 || y < y0 || y > y1) continue;
-      var full = AR.CFG.meatPerMass * sim.cMass[c] + 1e-3;
+      var full = sim.cMax[c] + 1e-3;
       var frac = M.clamp(sim.cMeat[c] / full, 0, 1);
       if (s < 9) {
         ctx.fillStyle = 'rgba(236,226,206,' + (0.35 + 0.4 * frac).toFixed(2) + ')';
@@ -5665,7 +5738,7 @@ var AR = {};
       AR.portrait($('spPortrait'), lk, Sx.bg || [40, 60, 70], { relative: true });
     }
     var parent = Sx.parent >= 0 ? sim.species[Sx.parent] : null;
-    var sub = parent ? 'Split from ' + short(parent) + ' in year ' + App.yearStr(Sx.born) : (Sx.epithet === 'redux' ? 'Castaway founders, year ' + App.yearStr(Sx.born) : 'The first species');
+    var sub = parent ? 'Split from ' + short(parent) + ' in year ' + App.yearStr(Sx.born) : (Sx.epithet === 'redux' ? 'Castaway founders, year ' + App.yearStr(Sx.born) : (Sx.born > 0 ? 'Washed ashore from overseas in year ' + App.yearStr(Sx.born) : 'The first species'));
     $('spSub').textContent = sub;
     var chips = [];
     var dc = dietClass(t, Sx);
@@ -5893,7 +5966,8 @@ var AR = {};
     var withMom = s === S.HERD && sim.cm[i] < sim.ph[i * NP + P.MASS] && sim.momNear(i, 1e9) >= 0;
     if (s === S.GRAZE || ((s === S.ROAM || s === S.HERD) && sim.lastAte[i] === 1)) {
       var fk = sim.fk[i];
-      var verb = ['Grazing', 'Browsing leaves', 'Grazing kelp', 'Fishing', '', '', 'Catching insects'][fk] || 'Feeding';
+      var wader = sim.ph[i * NP + P.SWIM] < 0.2;
+      var verb = ['Grazing', 'Browsing leaves', wader ? 'Grazing seaweed' : 'Grazing kelp', wader ? 'Catching crabs and shellfish' : 'Fishing', '', '', 'Catching insects'][fk] || 'Feeding';
       if (s !== S.GRAZE) return (sim.inW[i] ? 'Swimming' : (s === S.HERD ? (withMom ? 'Following its mother' : 'Following the herd') : 'Roaming')) + ' and ' + verb.toLowerCase();
       return verb;
     }
@@ -6432,11 +6506,17 @@ var AR = {};
       });
     } else if (l === 'food') {
       lg.hidden = false;
-      lg.innerHTML = '<div class="ttl">Food growing now</div>' +
-        '<div class="fk"><span class="sw" style="background:' + gradCss(AR.Terrain.RAMP_GRASS) + '"></span>Grass</div>' +
-        '<div class="fk"><span class="sw" style="background:' + gradCss(AR.Terrain.RAMP_LEAF) + '"></span>Leaves and fruit</div>' +
-        '<div class="fk"><span class="sw" style="background:' + gradCss(AR.Terrain.RAMP_SEAF) + '"></span>Kelp and fish</div>' +
+      var bugs = R.lensMode === 'insects';
+      lg.innerHTML = '<div class="seg lg-seg"><button data-m="plants" aria-pressed="' + !bugs + '">Plants</button><button data-m="insects" aria-pressed="' + bugs + '">Insects</button></div>' +
+        (bugs ? '<div class="fk"><span class="sw" style="background:' + gradCss(AR.Terrain.RAMP_BUGS) + '"></span>Insects and grubs</div>' +
+          '<div class="fk"><span class="sw" style="background:' + gradCss(AR.Terrain.RAMP_SEAF) + '"></span>Fish and shellfish</div>'
+        : '<div class="fk"><span class="sw" style="background:' + gradCss(AR.Terrain.RAMP_GRASS) + '"></span>Grass</div>' +
+          '<div class="fk"><span class="sw" style="background:' + gradCss(AR.Terrain.RAMP_LEAF) + '"></span>Leaves and fruit</div>' +
+          '<div class="fk"><span class="sw" style="background:' + gradCss(AR.Terrain.RAMP_SEAF) + '"></span>Kelp and fish</div>') +
         '<div class="ends"><span>Bare</span><span>Plenty</span></div>';
+      Array.prototype.forEach.call(lg.querySelectorAll('.lg-seg button'), function (b) {
+        b.onclick = function () { R.lensMode = b.dataset.m; updateLegend(); };
+      });
     } else if (l === 'coats') {
       lg.hidden = false;
       lg.innerHTML = '<div class="ttl">Coat colours as they really are</div><div class="ends"><span>Camouflage hides prey from hunters</span></div>';
@@ -6633,7 +6713,8 @@ var AR = {};
       '<h3>The world</h3><p>The far north is polar ice and tundra, the far south hot rainforest, and in between lie forests, grasslands and a belt of desert. Ice ages come and go slowly: glaciers spread south, the seas fall and land bridges join the islands. The deserts have their own rhythm, swelling in dry ages and turning green and breaking apart in wet ones.</p>' +
       '<h3>The first arrivals</h3><p>A small herd of plant-eaters reaches the greenest big island first. Once they are well established, usually within a century, storm wreckage brings a handful of small insect-eaters: the islands\' first meat-eaters. Most real hunters evolved from insect-eaters like these, and here too hunters, scavengers and fish-eaters can evolve from them. You can start with plant-eaters alone in World options, but then hunters seldom, if ever, appear.</p>' +
       '<h3>Genes</h3><p>Every animal has two copies of 30 genes, one from each parent. They set its size, legs, swimming, senses, fur, armour, jaws, whether it eats grass or leaves, desert hardiness, poison, coat colour, crest, litter size, behaviour and its own mutation rate. Copies can mutate when passed on, and the mutation rate itself evolves.</p>' +
-      '<h3>Ways to make a living</h3><p>Grass grows in open country and leaves and fruit in forests. Grazers and browsers each do badly on the other\'s food, so they can live side by side. Coastal shallows hold kelp and fish, richest in cold polar seas, but only swimmers can reach them, and strong swimmers are slow on land. Meat comes from carcasses or from hunting. Insects and grubs swarm in warm, wet forests, food for small animals with a taste for meat. An omnivore is not as good at either food as a specialist, and pays for the teeth and gut to handle both.</p>' +
+      '<h3>Ways to make a living</h3><p>Grass grows in open country and leaves and fruit in forests. Grazers and browsers each do badly on the other\'s food, so they can live side by side. At the water\'s edge any animal can graze seaweed or, with a meat-eater\'s jaws, catch crabs, shellfish and small fish, a rich meal that suits bigger animals best. A fished-out shore is slow to restock, but the kelp beds and fish further out, richest in cold polar seas, are there for swimmers, and strong swimmers are slow on land. Meat comes from carcasses or from hunting, and a body is worth far less as food than the animal ate in its life, so no animal can live on its own kind. Insects and grubs feed on fallen leaves and other plant litter, so they swarm where plants grow thickly, above all in warm, wet forests: food for small animals with a taste for meat. An omnivore is not as good at either food as a specialist, and pays for the teeth and gut to handle both.</p>' +
+      '<h3>Where the energy comes from</h3><p>All food starts as sunlight. On land the plants capture it and pass it on to plant-eaters and to the insects that live on fallen leaves; in the sea the fish stand for a whole food chain built on plankton. Meat is always second-hand: a carcass holds only a small part of the food the animal ate in its life, because most of it was burnt just staying alive. So meat-eaters can only last where plant-eaters, insects or fish live alongside them, never on each other alone. A species card\'s Jaws line shows what its teeth and gut are built for, and its Eats line what it actually lives on: an insect-eater with meat-eater\'s jaws is still living on the plants, one step removed.</p>' +
       '<h3>Heat, cold and thirst</h3><p>Fur or blubber keeps out the cold but overheats in the tropics. Deserts are hot and dry: animals without desert adaptations go thirsty there, so a wide desert is a barrier only adapted species can cross.</p>' +
       '<h3>Choosing a mate</h3><p>Females accept males whose crest colour matches what they prefer, and they favour males built like themselves: a similar size, similar jaws, similar mouths and the same life on land or in water. So when lineages start living differently they also stop mixing, and one population can split in two even on a single island.</p>' +
       '<h3>Predators, camouflage and poison</h3><p>Hunters spot animals that stand out against the ground, so prey can evolve camouflage; forests hide everyone, and keen senses see through disguises, spot danger sooner and sniff out hidden food such as grubs and fish. Hunters get good at spotting the kind of prey they catch most and tend to pass over unfamiliar ones, so rare-looking prey, and rare species, are overlooked. A hunter seldom brings down prey much bigger than itself, and youngsters keep close to their mothers, who defend them. Prey can answer with speed, size, armour, caution, fleeing into water, or poison. Rainforests are full of toxic plants: animals that evolve resistance can eat them and store the toxins, as poison dart frogs do. A poisonous animal is often spat out alive and the hunter learns to avoid its colour, so poisonous species can evolve bright warning colours.</p>' +
@@ -6670,7 +6751,7 @@ var AR = {};
   };
 })(AR);
 
-AR.VERSION = "3";
+AR.VERSION = "3.1";
 
 document.addEventListener('gesturestart', function (e) { e.preventDefault(); });
 AR.App.boot();
